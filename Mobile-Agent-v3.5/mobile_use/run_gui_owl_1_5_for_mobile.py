@@ -59,16 +59,32 @@ def parse_args():
 
 
 def parse_action(output_text):
-    """
-    Extract the action dict from the model's output text.
-    Expects a <tool_call> block containing JSON with nested 'arguments'.
-    """
+    """Extract an action dict from the model's <tool_call> JSON block."""
+    if not isinstance(output_text, str) or "<tool_call>" not in output_text:
+        raise ValueError("Model output does not contain a <tool_call> block")
+    tool_call_block = output_text.split("<tool_call>", 1)[1]
+    tool_call_block = tool_call_block.split("</tool_call>", 1)[0].strip()
     try:
-        tool_call_block = output_text.split("<tool_call>\n")[1]
-        json_str = tool_call_block.split("}}\n")[0] + "}}"
-        return json.loads(json_str)
-    except (IndexError, json.JSONDecodeError) as e:
-        raise ValueError(f"Failed to parse action from model output: {e}")
+        action = json.loads(tool_call_block)
+    except json.JSONDecodeError as e:
+        raise ValueError("Invalid JSON in <tool_call> block") from e
+    if not isinstance(action, dict) or not isinstance(action.get("arguments"), dict):
+        raise ValueError("Tool call must contain an arguments object")
+    if not isinstance(action["arguments"].get("action"), str):
+        raise ValueError("Tool call arguments must include an action")
+    return action
+
+
+def predict_action_with_retry(vllm, messages, max_attempts=2):
+    """Retry malformed model actions without dispatching an invalid action."""
+    for attempt in range(1, max_attempts + 1):
+        output_text, _, _ = vllm.predict_mm(messages)
+        print(f"[MODEL OUTPUT]\n{output_text}")
+        try:
+            return output_text, parse_action(output_text)
+        except ValueError as e:
+            print(f"[WARN] Invalid tool call ({attempt}/{max_attempts}): {e}")
+    return None, None
 
 
 def rescale_coordinates(action_parameter, resized_width, resized_height):
@@ -185,12 +201,12 @@ def main():
         )
 
         vllm = GUIOwlWrapper(args.api_key, args.base_url, args.model)
-        output_text, _, _ = vllm.predict_mm(messages)
 
-        print(f"[MODEL OUTPUT]\n{output_text}")
-
-        # 3. Parse the action
-        action = parse_action(output_text)
+        # 3. Only dispatch a successfully parsed tool call.
+        output_text, action = predict_action_with_retry(vllm, messages)
+        if action is None:
+            print("[WARN] No valid tool call after retry; skipping this step.")
+            continue
         action_parameter = action["arguments"]
 
         # 4. Rescale coordinates from 1000x1000 to actual resolution
